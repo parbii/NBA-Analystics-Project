@@ -1,32 +1,33 @@
 """
 daily_refresh.py
 ================
-Free, zero-key daily data pipeline.
+Parb's fully automated daily NBA pipeline.
+Runs every day — skips automatically if no games are scheduled.
 
-Fetch order (per player):
-  1. ESPN hidden API  — fastest, live/same-day box scores
-  2. nba_api          — full season game logs after games complete
-  3. StatMuse scraper — fallback if nba_api gets rate-limited
-
-After fetching:
-  → Stitches all player CSVs into Bulls_Master_2026.csv
-  → Runs Bulls dashboard analysis  (bulls_advanced_signals.csv)
-  → Runs Parbs role-player engine  (parbs_picks_global_report.csv)
-  → Runs chart + thumbnail generation
+Pipeline order (every run):
+  1. Check ESPN for today's games — exits cleanly if none
+  2. Fetch tonight's rosters (B-Ref → ESPN → nba_api)
+     → ESPN active roster validation strips traded/waived players
+  3. Pull live injury report from ESPN
+  4. Fetch Bulls player game logs (ESPN box score → nba_api → StatMuse)
+  5. Stitch Bulls game logs into Bulls_Master_2026.csv
+  6. Run full analysis (injuries filtered, all roles scored)
+  7. TF prop model predictions (retrain every Monday)
+  8. Generate charts + thumbnails
 
 Usage:
-  python daily_refresh.py              # full run
-  python daily_refresh.py --fetch-only # skip analysis/charts
-  python daily_refresh.py --analyze-only # skip fetching
+  python3 daily_refresh.py                # full run
+  python3 daily_refresh.py --fetch-only   # data only, skip analysis
+  python3 daily_refresh.py --analyze-only # analysis only, skip fetching
+  python3 daily_refresh.py --force        # run even if no games today
 """
 
-import os, sys, time, random, logging, importlib, runpy
+import os, sys, time, random, logging, runpy
 import requests
 import pandas as pd
 from datetime import date, datetime
-from io import StringIO
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -38,304 +39,251 @@ logging.basicConfig(
 )
 log = logging.getLogger("daily_refresh")
 
-# ── Roster ────────────────────────────────────────────────────────────────────
-# Add / remove players here. nba_api_id comes from stats.nba.com player IDs.
-ROSTER = [
-    {"name": "Josh Giddey",       "nba_api_id": "1630581"},
-    {"name": "Coby White",        "nba_api_id": "1629632"},
-    {"name": "Nikola Vucevic",    "nba_api_id": "202696"},
-    {"name": "Zach LaVine",       "nba_api_id": "203897"},
-    {"name": "Patrick Williams",  "nba_api_id": "1630172"},
-    {"name": "Ayo Dosunmu",       "nba_api_id": "1630544"},
-    {"name": "Tre Jones",         "nba_api_id": "1630200"},
-    {"name": "Jaden Ivey",        "nba_api_id": "1630596"},
-    {"name": "Collin Sexton",     "nba_api_id": "1629012"},
-    {"name": "Matas Buzelis",     "nba_api_id": "1642258"},
-]
-
-SEASON = "2025-26"
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def csv_path(player_name: str) -> str:
-    return f"{player_name.lower().replace(' ', '_')}_stats_2026.csv"
-
-def cooldown(lo=4, hi=9):
-    wait = random.uniform(lo, hi)
-    log.info(f"  ⏳ cooling off {round(wait, 1)}s...")
-    time.sleep(wait)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 1 — ESPN hidden API (no key, live same-day data)
-# ─────────────────────────────────────────────────────────────────────────────
-ESPN_HEADERS = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/122.0.0.0 Safari/537.36",
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json",
 }
 
-def espn_get_today_game_ids() -> list:
-    """Returns ESPN game IDs for today's NBA slate."""
+SEASON = "2025-26"
+
+# ── Bulls roster (update each season) ────────────────────────────────────────
+BULLS_ROSTER = [
+    {"name": "Josh Giddey",      "nba_api_id": "1630581"},
+    {"name": "Coby White",       "nba_api_id": "1629632"},
+    {"name": "Nikola Vucevic",   "nba_api_id": "202696"},
+    {"name": "Patrick Williams", "nba_api_id": "1630172"},
+    {"name": "Ayo Dosunmu",      "nba_api_id": "1630544"},
+    {"name": "Tre Jones",        "nba_api_id": "1630200"},
+    {"name": "Jaden Ivey",       "nba_api_id": "1630596"},
+    {"name": "Collin Sexton",    "nba_api_id": "1629012"},
+    {"name": "Matas Buzelis",    "nba_api_id": "1642258"},
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0 — Game day check
+# ─────────────────────────────────────────────────────────────────────────────
+def get_todays_games() -> list:
+    """Returns list of game event dicts from ESPN. Empty = no games today."""
     today = date.today().strftime("%Y%m%d")
-    url = (
-        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-        f"?dates={today}"
-    )
+    url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={today}"
     try:
-        r = requests.get(url, headers=ESPN_HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         r.raise_for_status()
-        events = r.json().get("events", [])
-        ids = [e["id"] for e in events]
-        log.info(f"ESPN: {len(ids)} game(s) found today.")
-        return ids
+        return r.json().get("events", [])
     except Exception as e:
-        log.warning(f"ESPN scoreboard failed: {e}")
+        log.warning(f"ESPN schedule check failed: {e}")
         return []
 
-def espn_player_stats_from_game(game_id: str) -> pd.DataFrame:
-    """Pulls box score for one game, returns a flat player-stats DataFrame."""
-    url = (
-        "https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
-        f"?event={game_id}"
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Tonight's rosters (delegates to parbs_league_master.py)
+#           Includes: B-Ref stats → ESPN active validation → nba_api fallback
+#           Injury report pulled inside parbs_master_analysis.py
+# ─────────────────────────────────────────────────────────────────────────────
+def run_league_master():
+    log.info("\n" + "="*55)
+    log.info("  STEP 1 — FETCHING TONIGHT'S ROSTERS (ALL SOURCES)")
+    log.info("  Validates every player against ESPN active roster")
+    log.info("="*55)
     try:
-        r = requests.get(url, headers=ESPN_HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        rows = []
-        for team in data.get("boxscore", {}).get("players", []):
-            team_abbr = team["team"]["abbreviation"]
-            for stat_group in team.get("statistics", []):
-                keys = stat_group.get("keys", [])
-                for athlete in stat_group.get("athletes", []):
-                    vals = athlete.get("stats", [])
-                    row = dict(zip(keys, vals))
-                    row["PLAYER"] = athlete["athlete"]["displayName"]
-                    row["TEAM_ABBR"] = team_abbr
-                    row["GAME_ID"] = game_id
-                    row["GAME_DATE"] = date.today().isoformat()
-                    rows.append(row)
-        return pd.DataFrame(rows)
+        runpy.run_path("parbs_league_master.py", run_name="__main__")
+        log.info("  ✅ Parbs_League_Master_2026.csv — verified active players only.")
     except Exception as e:
-        log.warning(f"ESPN box score failed for game {game_id}: {e}")
-        return pd.DataFrame()
+        log.error(f"  ❌ League master failed: {e}")
 
-def fetch_via_espn(player_name: str) -> bool:
-    """
-    Pulls today's box score stats for a player from ESPN.
-    Appends to their existing CSV so history is preserved.
-    """
-    game_ids = espn_get_today_game_ids()
-    if not game_ids:
-        return False
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Bulls game log fetching
+# ─────────────────────────────────────────────────────────────────────────────
+def csv_path(name: str) -> str:
+    return f"{name.lower().replace(' ', '_')}_stats_2026.csv"
 
+def cooldown(lo=5, hi=10):
+    wait = random.uniform(lo, hi)
+    log.info(f"  ⏳ {round(wait,1)}s cooldown...")
+    time.sleep(wait)
+
+def fetch_via_espn(player_name: str, game_ids: list) -> bool:
     for gid in game_ids:
-        df = espn_player_stats_from_game(gid)
-        if df.empty:
-            continue
-        # Normalise name matching (case-insensitive)
-        match = df[df["PLAYER"].str.lower() == player_name.lower()]
-        if match.empty:
-            continue
-
-        # Standardise columns
-        match = match.copy()
-        match.columns = [c.upper() for c in match.columns]
-
-        out = csv_path(player_name)
-        if os.path.exists(out):
-            existing = pd.read_csv(out)
-            existing.columns = [c.upper() for c in existing.columns]
-            combined = pd.concat([existing, match], ignore_index=True)
-            # Deduplicate by game id if column exists
-            if "GAME_ID" in combined.columns:
-                combined = combined.drop_duplicates(subset=["GAME_ID"])
-            combined.to_csv(out, index=False)
-        else:
-            match.to_csv(out, index=False)
-
-        log.info(f"  ✅ ESPN: {player_name} — today's box score saved.")
-        return True
-
-    log.info(f"  ℹ️  ESPN: {player_name} not in today's games.")
+        url = (f"https://site.web.api.espn.com/apis/site/v2/sports/basketball"
+               f"/nba/summary?event={gid}")
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            rows = []
+            for team in r.json().get("boxscore", {}).get("players", []):
+                abbr = team["team"]["abbreviation"]
+                for grp in team.get("statistics", []):
+                    keys = grp.get("keys", [])
+                    for athlete in grp.get("athletes", []):
+                        row = dict(zip(keys, athlete.get("stats", [])))
+                        row.update({"PLAYER": athlete["athlete"]["displayName"],
+                                    "TEAM_ABBR": abbr, "GAME_ID": gid,
+                                    "GAME_DATE": date.today().isoformat()})
+                        rows.append(row)
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            match = df[df["PLAYER"].str.lower() == player_name.lower()]
+            if match.empty:
+                continue
+            match = match.copy()
+            match.columns = [c.upper() for c in match.columns]
+            out = csv_path(player_name)
+            if os.path.exists(out):
+                existing = pd.read_csv(out)
+                existing.columns = [c.upper() for c in existing.columns]
+                combined = pd.concat([existing, match], ignore_index=True)
+                if "GAME_ID" in combined.columns:
+                    combined = combined.drop_duplicates(subset=["GAME_ID"])
+                combined.to_csv(out, index=False)
+            else:
+                match.to_csv(out, index=False)
+            log.info(f"  ✅ ESPN: {player_name} box score saved.")
+            return True
+        except Exception as e:
+            log.warning(f"  ESPN box score error for game {gid}: {e}")
     return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 2 — nba_api (full season game logs, no key)
-# ─────────────────────────────────────────────────────────────────────────────
 def fetch_via_nba_api(player_name: str, nba_api_id: str) -> bool:
-    """Pulls full season game log from stats.nba.com."""
     try:
         from nba_api.stats.endpoints import playergamelog
     except ImportError:
-        log.warning("nba_api not installed. Run: pip install nba_api")
+        log.warning("nba_api not installed.")
         return False
-
-    NBA_HEADERS = {
+    nba_headers = {
         "Host": "stats.nba.com",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "x-nba-stats-origin": "stats",
         "x-nba-stats-token": "true",
         "Referer": "https://stats.nba.com/",
     }
-
     try:
-        log.info(f"  🏀 nba_api: fetching {player_name}...")
+        log.info(f"  🏀 nba_api: {player_name}...")
         gl = playergamelog.PlayerGameLog(
-            player_id=nba_api_id,
-            season=SEASON,
-            headers=NBA_HEADERS,
-            timeout=90,
-        )
+            player_id=nba_api_id, season=SEASON,
+            headers=nba_headers, timeout=90)
         df = gl.get_data_frames()[0]
         if df.empty:
-            log.warning(f"  ⚠️  nba_api returned empty for {player_name}")
             return False
-
         df["PLAYER_NAME"] = player_name
         df.columns = [c.upper() for c in df.columns]
         df.to_csv(csv_path(player_name), index=False)
-        log.info(f"  ✅ nba_api: {player_name} — {len(df)} games saved.")
+        log.info(f"  ✅ nba_api: {player_name} — {len(df)} games.")
         return True
     except Exception as e:
-        log.warning(f"  ❌ nba_api failed for {player_name}: {e}")
+        log.warning(f"  ❌ nba_api: {player_name}: {e}")
         return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 3 — StatMuse scraper (fallback, no key)
-# ─────────────────────────────────────────────────────────────────────────────
 def fetch_via_statmuse(player_name: str) -> bool:
-    """Falls back to StatMuse HTML scraping."""
     try:
         sys.path.insert(0, os.path.join(os.getcwd(), "data_ingestion"))
         from sm_scraper import SMScraper
-        scraper = SMScraper()
-        return scraper.sync_player(player_name)
+        return SMScraper().sync_player(player_name)
     except Exception as e:
-        log.warning(f"  ❌ StatMuse failed for {player_name}: {e}")
+        log.warning(f"  ❌ StatMuse: {player_name}: {e}")
         return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FETCH ORCHESTRATOR — tries all 3 sources in order
-# ─────────────────────────────────────────────────────────────────────────────
-def fetch_player(player: dict) -> bool:
-    name = player["name"]
-    nba_id = player["nba_api_id"]
-    log.info(f"\n{'─'*55}")
-    log.info(f"🔄 Syncing: {name}")
-
-    # 1. Try ESPN first (live/today)
-    if fetch_via_espn(name):
-        cooldown(2, 5)
-        return True
-
-    # 2. Try nba_api for full game log
-    if fetch_via_nba_api(name, nba_id):
-        cooldown(6, 11)
-        return True
-
-    # 3. Fall back to StatMuse
-    log.info(f"  🔁 Falling back to StatMuse for {name}...")
-    if fetch_via_statmuse(name):
-        cooldown(3, 7)
-        return True
-
-    log.error(f"  💀 All sources failed for {name}. Skipping.")
-    return False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE STEPS
-# ─────────────────────────────────────────────────────────────────────────────
-def run_fetch():
+def run_fetch(game_ids: list):
     log.info("\n" + "="*55)
-    log.info("  STEP 1 — FETCHING PLAYER DATA")
+    log.info("  STEP 2 — FETCHING BULLS GAME LOGS")
     log.info("="*55)
-    results = {"ok": [], "failed": []}
-    for player in ROSTER:
-        ok = fetch_player(player)
-        (results["ok"] if ok else results["failed"]).append(player["name"])
+    ok, failed = [], []
+    for player in BULLS_ROSTER:
+        name, pid = player["name"], player["nba_api_id"]
+        log.info(f"\n  🔄 {name}")
+        if fetch_via_espn(name, game_ids):
+            ok.append(name); cooldown(2, 5); continue
+        if fetch_via_nba_api(name, pid):
+            ok.append(name); cooldown(6, 11); continue
+        log.info(f"  🔁 StatMuse fallback...")
+        if fetch_via_statmuse(name):
+            ok.append(name); cooldown(3, 7); continue
+        log.error(f"  💀 All sources failed: {name}")
+        failed.append(name)
+    log.info(f"\n  ✅ Fetched: {ok}")
+    if failed:
+        log.warning(f"  ❌ Failed:  {failed}")
 
-    log.info(f"\n✅ Fetched:  {results['ok']}")
-    if results["failed"]:
-        log.warning(f"❌ Failed:   {results['failed']}")
-    return results
-
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Stitch Bulls master CSV
+# ─────────────────────────────────────────────────────────────────────────────
 def run_stitch():
     log.info("\n" + "="*55)
-    log.info("  STEP 2 — STITCHING MASTER CSV")
+    log.info("  STEP 3 — STITCHING BULLS MASTER CSV")
     log.info("="*55)
     import glob
-    all_files = glob.glob("*_stats_2026.csv")
-    if not all_files:
-        log.error("No player CSVs found. Run fetch first.")
+    files = glob.glob("*_stats_2026.csv")
+    if not files:
+        log.error("  No player CSVs found.")
         return
-
     frames = []
-    for f in all_files:
+    for f in files:
         try:
             df = pd.read_csv(f)
-            player_name = f.split("_stats")[0].replace("_", " ").title()
-            df["PLAYER_NAME"] = player_name
+            df["PLAYER_NAME"] = f.split("_stats")[0].replace("_", " ").title()
             df.columns = [c.upper() for c in df.columns]
             frames.append(df)
         except Exception as e:
-            log.warning(f"Could not read {f}: {e}")
-
-    master = pd.concat(frames, axis=0, ignore_index=True)
+            log.warning(f"  Could not read {f}: {e}")
+    master = pd.concat(frames, ignore_index=True)
     master.to_csv("Bulls_Master_2026.csv", index=False)
-    log.info(f"✅ Bulls_Master_2026.csv — {len(master)} rows across {len(frames)} players.")
+    log.info(f"  ✅ Bulls_Master_2026.csv — {len(master)} rows, {len(frames)} players.")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Full analysis (injuries + all roles)
+# ─────────────────────────────────────────────────────────────────────────────
 def run_analysis():
     log.info("\n" + "="*55)
-    log.info("  STEP 3 — RUNNING ANALYSIS")
+    log.info("  STEP 4 — RUNNING ANALYSIS (injuries + all roles)")
     log.info("="*55)
-    scripts = [
-        ("bulls_dashboard.py",      "Bulls advanced signals"),
-        ("parbs_master_analysis.py","Parbs role-player engine"),
-        ("parbs_global_analysis.py","Parbs matchup/defense signals"),
-    ]
-    for script, label in scripts:
+    for script, label in [
+        ("bulls_dashboard.py",       "Bulls advanced signals"),
+        ("parbs_master_analysis.py", "Parbs full report (injuries + roles)"),
+        ("parbs_global_analysis.py", "Parbs matchup/defense signals"),
+    ]:
         if not os.path.exists(script):
             log.warning(f"  ⚠️  {script} not found, skipping.")
             continue
         try:
-            log.info(f"  ▶ Running {label}...")
+            log.info(f"  ▶ {label}...")
             runpy.run_path(script, run_name="__main__")
-            log.info(f"  ✅ {label} complete.")
+            log.info(f"  ✅ {label} done.")
         except Exception as e:
             log.error(f"  ❌ {label} failed: {e}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — TF prop model
+# ─────────────────────────────────────────────────────────────────────────────
 def run_tf_model():
     log.info("\n" + "="*55)
-    log.info("  STEP 4 — TF PROP MODEL (Regression + Filters)")
+    log.info("  STEP 5 — TF PROP MODEL")
     log.info("="*55)
     if not os.path.exists("Bulls_Master_2026.csv"):
-        log.warning("  ⚠️  Bulls_Master_2026.csv not found, skipping TF model.")
+        log.warning("  ⚠️  Bulls_Master_2026.csv missing, skipping.")
         return
     try:
         import tf_prop_model
-        # Re-train weekly (Monday), predict every day
-        import datetime
-        if datetime.date.today().weekday() == 0:  # Monday
-            log.info("  🧠 Monday — re-training model on fresh data...")
+        if date.today().weekday() == 0:  # Monday = retrain
+            log.info("  🧠 Monday — retraining on fresh data...")
             tf_prop_model.train()
         tf_prop_model.predict()
-        log.info("  ✅ TF predictions saved → tf_prop_predictions.csv")
+        log.info("  ✅ Predictions → tf_prop_predictions.csv")
     except ImportError:
-        log.warning("  ⚠️  TensorFlow not installed. Run: pip install tensorflow scikit-learn")
+        log.warning("  ⚠️  TensorFlow not installed: pip install tensorflow scikit-learn")
     except Exception as e:
         log.error(f"  ❌ TF model failed: {e}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Charts + thumbnails
+# ─────────────────────────────────────────────────────────────────────────────
 def run_visuals():
     log.info("\n" + "="*55)
-    log.info("  STEP 5 — GENERATING CHARTS & THUMBNAILS")
+    log.info("  STEP 6 — CHARTS & THUMBNAILS")
     log.info("="*55)
     for script, label in [
-        ("parbs_chart_gen.py",  "Global chart"),
-        ("parbs_thumb_gen.py",  "Elite pick thumbnail"),
+        ("parbs_chart_gen.py", "Global chart"),
+        ("parbs_thumb_gen.py", "Elite pick thumbnail"),
     ]:
         if not os.path.exists(script):
             log.warning(f"  ⚠️  {script} not found, skipping.")
@@ -353,20 +301,44 @@ def run_visuals():
 if __name__ == "__main__":
     fetch_only   = "--fetch-only"   in sys.argv
     analyze_only = "--analyze-only" in sys.argv
+    force        = "--force"        in sys.argv
 
     start = datetime.now()
     log.info(f"\n{'='*55}")
-    log.info(f"  🏀 PARB'S DAILY REFRESH — {date.today()}")
+    log.info(f"  🏀 PARB'S DAILY REFRESH — {date.today().strftime('%A, %B %d %Y')}")
     log.info(f"{'='*55}")
 
+    # ── Game day guard ────────────────────────────────────────────────────────
+    games = get_todays_games()
+    if not games and not force:
+        log.info("  📅 No NBA games scheduled today. Pipeline skipped.")
+        log.info("  Run with --force to override.")
+        sys.exit(0)
+
+    log.info(f"  📅 {len(games)} game(s) tonight — running full pipeline.\n")
+    game_ids = [g["id"] for g in games]
+
     if not analyze_only:
-        run_fetch()
-        run_stitch()
+        run_league_master()   # rosters + ESPN active validation + injury awareness
+        run_fetch(game_ids)   # Bulls game logs
+        run_stitch()          # Bulls_Master_2026.csv
 
     if not fetch_only:
-        run_analysis()
-        run_tf_model()
-        run_visuals()
+        run_analysis()        # injuries filtered, all roles scored
+        run_tf_model()        # regression predictions
+        run_visuals()         # charts + thumbnails
+        # Investment engine — always last, uses all prior outputs
+        log.info("\n" + "="*55)
+        log.info("  STEP 7 — INVESTMENT SCORING ENGINE")
+        log.info("="*55)
+        try:
+            runpy.run_path("parbs_investment_engine.py", run_name="__main__")
+            log.info("  ✅ Investment picks → parbs_investment_picks.csv")
+        except Exception as e:
+            log.error(f"  ❌ Investment engine failed: {e}")
 
     elapsed = round((datetime.now() - start).total_seconds(), 1)
-    log.info(f"\n🏁 Done in {elapsed}s. Check logs/refresh_{date.today()}.log for full output.")
+    log.info(f"\n{'='*55}")
+    log.info(f"  🏁 Done in {elapsed}s — {date.today()}")
+    log.info(f"  📋 Log → logs/refresh_{date.today()}.log")
+    log.info(f"{'='*55}")
