@@ -329,13 +329,14 @@ if __name__ == "__main__":
         run_visuals()         # charts + thumbnails
         # Investment engine — always last, uses all prior outputs
         log.info("\n" + "="*55)
-        log.info("  STEP 7 — INVESTMENT SCORING ENGINE")
+        log.info("  STEP 7 — DAILY PICKS ENGINE (filtered)")
         log.info("="*55)
         try:
-            runpy.run_path("parbs_investment_engine.py", run_name="__main__")
-            log.info("  ✅ Investment picks → parbs_investment_picks.csv")
+            import parbs_daily_picks
+            parbs_daily_picks.run(date.today())
+            log.info("  ✅ Picks → parbs_projections.csv")
         except Exception as e:
-            log.error(f"  ❌ Investment engine failed: {e}")
+            log.error(f"  ❌ Daily picks failed: {e}")
 
     elapsed = round((datetime.now() - start).total_seconds(), 1)
     log.info(f"\n{'='*55}")
