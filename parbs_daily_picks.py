@@ -293,6 +293,13 @@ def apply_filter(player, prop, line, proj, direction, spread, ssn_min, injury_re
     if direction == 'UNDER' and game_total > 220 and ssn_min < 28:
         warnings.append(f'⚠️  High-scoring game expected (total {game_total}) — UNDER on role player is riskier')
 
+    # Rule 8d — No UNDER on leading team's star in a close-out game
+    # Close-out games = stars play max minutes and go for the kill
+    series_lead = kwargs.get('series_lead', 0)  # e.g. 3 = leading 3-1
+    is_star = ssn_min >= 30  # starter logging 30+ min = star
+    if direction == 'UNDER' and series_lead >= 3 and is_star:
+        return False, 'SKIP', [f'UNDER blocked: leading team star in close-out game — stars go for the kill']
+
     # Rule 9 — Downgrade near-line picks
     effective_edge = edge_pct + conf_boost
     if effective_edge < 0.06 and direction == 'OVER':
