@@ -300,14 +300,30 @@ def apply_filter(player, prop, line, proj, direction, spread, ssn_min, injury_re
     if direction == 'UNDER' and series_lead >= 3 and is_star:
         return False, 'SKIP', [f'UNDER blocked: leading team star in close-out game — stars go for the kill']
 
-    # Rule 9 — Downgrade near-line picks
-    effective_edge = edge_pct + conf_boost
+    # Rule 8e — Star volatility: block UNDER on high-usage stars (20+ FGA avg)
+    # Stars with 20+ FGA are too volatile — one hot game blows up the card
+    # Target role players (6-14 FGA) for more predictable outcomes
+    if direction == 'UNDER' and l10_fga >= 18 and ssn_min >= 30:
+        return False, 'SKIP', [f'UNDER blocked: high-usage star ({l10_fga} FGA avg) — too volatile, target role players instead']
+
+    # Grade — with low-variance role player bonus
+    # Players with 6-14 FGA and 22-30 min are the most predictable targets
+    is_low_variance = 6 <= l10_fga <= 14 and 22 <= ssn_min <= 32
+    variance_boost = 0.02 if is_low_variance else 0  # +2% for role player consistency
+
+    effective_edge = edge_pct + conf_boost + variance_boost
+
+    # Grade
+    if is_low_variance:
+        warnings.append('LOW-VARIANCE ROLE PLAYER — consistent scoring range, higher reliability')
     if effective_edge < 0.06 and direction == 'OVER':
         warnings.append('Near-line OVER — lower confidence')
 
     # Grade
     if effective_edge >= 0.12:   grade = 'ELITE'
     elif effective_edge >= 0.08: grade = 'STRONG'
+    elif effective_edge >= 0.05: grade = 'SOLID'
+    else:                        grade = 'LEAN'    elif effective_edge >= 0.08: grade = 'STRONG'
     elif effective_edge >= 0.05: grade = 'SOLID'
     else:                        grade = 'LEAN'
 
