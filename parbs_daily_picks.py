@@ -306,6 +306,14 @@ def apply_filter(player, prop, line, proj, direction, spread, ssn_min, injury_re
     if direction == 'UNDER' and l10_fga >= 18 and ssn_min >= 30:
         return False, 'SKIP', [f'UNDER blocked: high-usage star ({l10_fga} FGA avg) — too volatile, target role players instead']
 
+    # Rule 8f — Public fade: block picks that appear on 3+ major public sites
+    # When Dimers + CBS + ActionNetwork + Covers all recommend the same player,
+    # the sportsbook has already priced it in — the edge is gone
+    # These picks are flagged as PUBLIC_FADE in the calling code
+    is_public_fade = kwargs.get('is_public_fade', False)
+    if is_public_fade:
+        warnings.append('⚠️  PUBLIC FADE: This pick is heavily promoted on public sites — line may be inflated. Reduce size or skip.')
+
     # Grade — with low-variance role player bonus
     # Players with 6-14 FGA and 22-30 min are the most predictable targets
     is_low_variance = 6 <= l10_fga <= 14 and 22 <= ssn_min <= 32
