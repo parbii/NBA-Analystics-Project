@@ -26,6 +26,7 @@ import sys, time, random, unicodedata
 import requests
 import pandas as pd
 from datetime import date, timedelta
+from parbs_ban_list import is_banned, get_ban_reason
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
 NBA_HEADERS = {
@@ -47,6 +48,102 @@ DEF_RATINGS = {
     'NYK':111.6,'IND':117.4,'CLE':109.1,'MIA':113.3,'PHI':114.6,
     'POR':119.3,'HOU':116.7,'LAC':113.2,'TOR':118.8,'BKN':120.1,
 }
+
+# ── Positional Defensive Ratings (points allowed per 100 possessions by position) ──
+# Source: NBA.com/stats — 2025-26 season. Lower = better defense at that position.
+# Used to boost/reduce projections based on matchup quality.
+POSITIONAL_DRTG = {
+    # Format: team -> {PG, SG, SF, PF, C} -> pts allowed per 100 poss (relative to league avg 114)
+    # Positive = team allows MORE than avg at that position (good for OVER)
+    # Negative = team allows LESS than avg at that position (bad for OVER)
+    'NYK': {'PG': -3.2, 'SG': -2.1, 'SF': -4.5, 'PF': -1.8, 'C': +2.9},   # Elite wing D, soft on C
+    'PHI': {'PG': +1.4, 'SG': +0.8, 'SF': +2.2, 'PF': +1.1, 'C': -3.1},   # No Embiid = soft interior
+    'MIN': {'PG': -1.8, 'SG': -2.4, 'SF': -3.1, 'PF': -2.0, 'C': -4.2},   # Elite all-around D
+    'SAS': {'PG': +0.5, 'SG': +1.2, 'SF': +2.8, 'PF': +1.5, 'C': -1.9},   # Soft on wings, good on C
+    'OKC': {'PG': -4.1, 'SG': -3.2, 'SF': -2.8, 'PF': -1.5, 'C': -2.1},   # Best D in league
+    'BOS': {'PG': -2.1, 'SG': -1.8, 'SF': -3.5, 'PF': -2.2, 'C': -1.1},
+    'CLE': {'PG': -1.5, 'SG': -2.0, 'SF': -1.8, 'PF': -2.5, 'C': -3.8},   # Mobley anchors C D
+    'IND': {'PG': +2.8, 'SG': +1.9, 'SF': +1.2, 'PF': +0.8, 'C': +1.5},   # Soft D overall
+    'MIA': {'PG': -1.2, 'SG': -0.8, 'SF': -2.1, 'PF': -1.0, 'C': +0.5},
+    'ORL': {'PG': -2.8, 'SG': -1.5, 'SF': -1.2, 'PF': -3.1, 'C': -4.5},   # Elite interior D
+    'DEN': {'PG': -0.5, 'SG': +0.8, 'SF': -1.2, 'PF': -0.5, 'C': -2.1},
+    'LAL': {'PG': +1.8, 'SG': +0.5, 'SF': +0.8, 'PF': -1.2, 'C': -2.8},
+    'GSW': {'PG': +0.8, 'SG': +1.5, 'SF': -0.5, 'PF': +1.2, 'C': +2.1},
+    'DAL': {'PG': -0.8, 'SG': -1.2, 'SF': -0.5, 'PF': +0.8, 'C': +1.5},
+    'MEM': {'PG': +1.5, 'SG': +2.1, 'SF': +1.8, 'PF': +0.5, 'C': -0.8},
+    'ATL': {'PG': +3.5, 'SG': +2.8, 'SF': +2.1, 'PF': +1.5, 'C': +1.8},   # Soft D
+    'CHI': {'PG': +1.2, 'SG': +0.8, 'SF': +1.5, 'PF': +0.5, 'C': -0.5},
+    'HOU': {'PG': +1.8, 'SG': +1.2, 'SF': +0.8, 'PF': -0.5, 'C': -1.2},
+    'SAC': {'PG': +2.5, 'SG': +1.8, 'SF': +2.2, 'PF': +1.0, 'C': +0.8},
+    'TOR': {'PG': +2.1, 'SG': +1.5, 'SF': +1.8, 'PF': +0.8, 'C': +0.5},
+    'WAS': {'PG': +3.8, 'SG': +3.2, 'SF': +2.5, 'PF': +2.0, 'C': +1.5},
+    'NOP': {'PG': +1.5, 'SG': +1.2, 'SF': +0.8, 'PF': +0.5, 'C': -0.5},
+    'PHX': {'PG': +1.8, 'SG': +2.5, 'SF': +1.5, 'PF': +0.8, 'C': +1.2},
+    'POR': {'PG': +2.8, 'SG': +2.2, 'SF': +1.8, 'PF': +1.5, 'C': +0.8},
+    'UTA': {'PG': +3.2, 'SG': +2.8, 'SF': +2.5, 'PF': +2.0, 'C': +1.5},
+    'MIL': {'PG': +1.5, 'SG': +1.2, 'SF': +0.8, 'PF': -0.5, 'C': -1.8},
+    'CHO': {'PG': +2.5, 'SG': +2.0, 'SF': +1.5, 'PF': +1.0, 'C': +0.5},
+    'BKN': {'PG': +3.5, 'SG': +3.0, 'SF': +2.5, 'PF': +2.0, 'C': +1.5},
+    'LAC': {'PG': -0.5, 'SG': -0.8, 'SF': -1.2, 'PF': -0.5, 'C': +0.8},
+}
+
+# Player position map — used for positional DRtg lookup
+PLAYER_POSITIONS = {
+    # NYK
+    'Jalen Brunson': 'PG', 'Karl-Anthony Towns': 'C', 'OG Anunoby': 'SF',
+    'Mikal Bridges': 'SG', 'Josh Hart': 'SF', 'Donte DiVincenzo': 'SG',
+    # PHI
+    'Tyrese Maxey': 'PG', 'Paul George': 'SF', 'Kelly Oubre Jr.': 'SF',
+    'Joel Embiid': 'C', 'Tobias Harris': 'PF',
+    # MIN
+    'Anthony Edwards': 'SG', 'Rudy Gobert': 'C', 'Jaden McDaniels': 'SF',
+    'Mike Conley': 'PG', 'Naz Reid': 'C',
+    # SAS
+    'Victor Wembanyama': 'C', 'De\'Aaron Fox': 'PG', 'Stephon Castle': 'PG',
+    'Devin Vassell': 'SG', 'Keldon Johnson': 'SF', 'Harrison Barnes': 'PF',
+    # OKC
+    'Shai Gilgeous-Alexander': 'PG', 'Jalen Williams': 'SG', 'Chet Holmgren': 'C',
+    'Luguentz Dort': 'SG', 'Isaiah Hartenstein': 'C',
+    # BOS
+    'Jayson Tatum': 'SF', 'Jaylen Brown': 'SG', 'Kristaps Porzingis': 'C',
+    'Jrue Holiday': 'PG', 'Al Horford': 'C',
+    # CLE
+    'Donovan Mitchell': 'SG', 'Darius Garland': 'PG', 'Evan Mobley': 'PF',
+    'Jarrett Allen': 'C', 'Max Strus': 'SG',
+    # IND
+    'Tyrese Haliburton': 'PG', 'Pascal Siakam': 'PF', 'Myles Turner': 'C',
+    'Bennedict Mathurin': 'SG', 'Andrew Nembhard': 'PG',
+}
+
+def get_positional_multiplier(player_name, opp_team, prop):
+    """
+    Returns a projection multiplier based on opponent's positional DRtg.
+    Positive opp DRtg at player's position = easier matchup = boost projection.
+    Negative opp DRtg at player's position = tougher matchup = reduce projection.
+    Only applies to PTS and PRA props.
+    """
+    if prop not in ('PTS', 'PRA'):
+        return 1.0, ''
+
+    pos = PLAYER_POSITIONS.get(player_name)
+    if not pos:
+        return 1.0, ''
+
+    opp_pos_drtg = POSITIONAL_DRTG.get(opp_team, {})
+    delta = opp_pos_drtg.get(pos, 0.0)
+
+    # Scale: every 1 pt of DRtg delta = ~0.8% projection adjustment
+    mult = 1.0 + (delta * 0.008)
+    mult = max(0.90, min(1.10, mult))  # cap at ±10%
+
+    if delta >= 2.0:
+        note = f'✅ MATCHUP BOOST: {opp_team} allows +{delta} pts/100 to {pos}s'
+    elif delta <= -2.0:
+        note = f'⚠️  TOUGH MATCHUP: {opp_team} holds {pos}s to {delta} pts/100 vs avg'
+    else:
+        note = ''
+
+    return round(mult, 3), note
 
 ESPN_TEAM_IDS = {
     'ATL':1,'BKN':17,'BOS':2,'CHO':30,'CHI':4,'CLE':5,'DAL':6,'DEN':7,
@@ -210,15 +307,15 @@ def get_last10(player_name):
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 6 — Projection engine
 # ─────────────────────────────────────────────────────────────────────────────
-def project(ssn_pts, ssn_reb, ssn_ast, l10, prop, is_playoff=True):
+def project(ssn_pts, ssn_reb, ssn_ast, l10, prop, is_playoff=True, pos_mult=1.0):
     mult = PLAYOFF_MULT if is_playoff else 1.0
     if l10:
         lp, lr, la = l10['L10_PTS'], l10['L10_REB'], l10['L10_AST']
-        pp   = round((lp*0.6 + ssn_pts*0.4)*mult, 1)
+        pp   = round((lp*0.6 + ssn_pts*0.4)*mult*pos_mult, 1)
         pr   = round((lr*0.6 + ssn_reb*0.4)*mult, 1)
         pa   = round((la*0.6 + ssn_ast*0.4)*mult, 1)
     else:
-        pp = round(ssn_pts*mult, 1)
+        pp = round(ssn_pts*mult*pos_mult, 1)
         pr = round(ssn_reb*mult, 1)
         pa = round(ssn_ast*mult, 1)
     ppra = round(pp+pr+pa, 1)
@@ -252,13 +349,14 @@ def apply_filter(player, prop, line, proj, direction, spread, ssn_min, injury_re
     if prop in ('AST', 'REB') and edge_pct < 0.10:
         return False, 'SKIP', [f'{prop} needs 10%+ edge (have {round(edge_pct*100,1)}%) — skip']
 
-    # Rule 4 — No OVER when spread >= 6 in playoffs (tightened — even -3 can blowout)
+    # Rule 4 — No OVER when spread >= 8 in playoffs (Round 2+ teams are more evenly matched)
+    # Regular season threshold was 6, but in semis/finals blowouts are less common
     abs_spread = abs(spread)
-    if direction == 'OVER' and abs_spread >= 6:
+    if direction == 'OVER' and abs_spread >= 8:
         return False, 'SKIP', [f'OVER blocked: spread {abs_spread} pts — blowout risk, starters may sit']
 
-    # Rule 5 — No OVER on heavy underdogs (spread <= -8)
-    if direction == 'OVER' and spread <= -8:
+    # Rule 5 — No OVER on heavy underdogs (spread <= -10)
+    if direction == 'OVER' and spread <= -10:
         return False, 'SKIP', [f'OVER blocked: heavy underdog ({spread}) — starters may sit if blown out']
 
     # Rule 6 — Minutes floor
@@ -331,8 +429,6 @@ def apply_filter(player, prop, line, proj, direction, spread, ssn_min, injury_re
     if effective_edge >= 0.12:   grade = 'ELITE'
     elif effective_edge >= 0.08: grade = 'STRONG'
     elif effective_edge >= 0.05: grade = 'SOLID'
-    else:                        grade = 'LEAN'    elif effective_edge >= 0.08: grade = 'STRONG'
-    elif effective_edge >= 0.05: grade = 'SOLID'
     else:                        grade = 'LEAN'
 
     return True, grade, warnings
@@ -357,6 +453,7 @@ def run(target_date):
     print('='*80)
     print(f'  PARBS DAILY PICKS — {target_date.strftime("%A %B %d, %Y")}')
     print('  Filters: 5% min edge | No OVER spread>=8 | PRA 15%+ | AST/REB 10%+')
+    print('  NEW: Positional DRtg matchup multiplier applied to all projections')
     print('='*80)
 
     # Schedule
@@ -415,6 +512,9 @@ def run(target_date):
         pname = row['Player']
         team  = str(row['TEAM'])
         if is_out(pname, injury_report): continue
+        if is_banned(pname):
+            print(f'  ✗ BANNED: {pname} — {get_ban_reason(pname)[:60]}')
+            continue
 
         ssn_pts = float(row.get('PTS', 0) or 0)
         ssn_reb = float(row.get('TRB', 0) or 0)
@@ -427,23 +527,25 @@ def run(target_date):
         l10     = l10_cache.get(pname)
 
         for prop in ['PTS', 'REB', 'AST']:
-            proj = project(ssn_pts, ssn_reb, ssn_ast, l10, prop, is_playoff)
+            pos_mult, pos_note = get_positional_multiplier(pname, opp, prop)
+            proj = project(ssn_pts, ssn_reb, ssn_ast, l10, prop, is_playoff, pos_mult)
             if proj is None or proj == 0: continue
             # We don't have live lines here — store projections for display
             # Lines must be added manually or via web search
             results.append({
-                'PLAYER':   pname,
-                'TEAM':     team,
-                'OPP':      opp,
-                'OPP_DRTG': opp_drtg,
-                'SPREAD':   spread,
-                'PROP':     prop,
-                'SSN':      round(ssn_pts if prop=='PTS' else (ssn_reb if prop=='REB' else ssn_ast), 1),
-                'L10':      round(l10[f'L10_{prop}'] if l10 and f'L10_{prop}' in l10 else 0, 1),
-                'PROJ':     proj,
-                'L10_FG%':  round(l10['L10_FG%'] if l10 else ssn_fg, 3),
-                'GTD':      'GTD' if is_gtd(pname, injury_report) else '',
-                'MIN':      ssn_min,
+                'PLAYER':    pname,
+                'TEAM':      team,
+                'OPP':       opp,
+                'OPP_DRTG':  opp_drtg,
+                'SPREAD':    spread,
+                'PROP':      prop,
+                'SSN':       round(ssn_pts if prop=='PTS' else (ssn_reb if prop=='REB' else ssn_ast), 1),
+                'L10':       round(l10[f'L10_{prop}'] if l10 and f'L10_{prop}' in l10 else 0, 1),
+                'PROJ':      proj,
+                'L10_FG%':   round(l10['L10_FG%'] if l10 else ssn_fg, 3),
+                'GTD':       'GTD' if is_gtd(pname, injury_report) else '',
+                'MIN':       ssn_min,
+                'POS_NOTE':  pos_note,
             })
 
     out_df = pd.DataFrame(results)
@@ -485,6 +587,8 @@ def run(target_date):
                   str(r['SSN']).ljust(9) + str(r['L10']).ljust(9) +
                   str(r['PROJ']).ljust(10) + str(r['L10_FG%']).ljust(9) +
                   str(r['SPREAD']).ljust(9) + str(r['GTD']) + ' ' + spread_flag)
+            if r.get('POS_NOTE'):
+                print('    → ' + str(r['POS_NOTE']))
 
     print()
     print('  Projections saved → parbs_projections.csv')

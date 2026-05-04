@@ -56,8 +56,7 @@ def get_blowout_risk(team, opp, spread):
     if abs_spread >= 12:
         risks.append('SPREAD_BLOWOUT_HIGH')
     elif abs_spread >= 8:
-        risks.append('SPREAD_BLOWOUT_MED')
-    
+        risks.append('SPREAD_BLOWOUT_MED')    
     # Team-specific blowout history
     team_risk = BLOWOUT_RISK.get(team, 'LOW')
     opp_risk  = BLOWOUT_RISK.get(opp, 'LOW')
@@ -117,8 +116,7 @@ def filter_pick(player, team, opp, prop, line, proj, direction, spread=0, ssn_mi
             warnings.append(f'⚠️  BLOWOUT RISK: Spread {abs(spread)} pts — starters may sit 4th')
             confidence_adj -= 20
             if edge_pct < 0.10:
-                return False, -40, ['OVER + large spread + small edge = skip']
-        
+                return False, -40, ['OVER + large spread + small edge = skip']        
         if 'HEAVY_UNDERDOG' in blowout_risks:
             warnings.append(f'⚠️  HEAVY UNDERDOG: Team likely down big — starters may sit')
             confidence_adj -= 15
