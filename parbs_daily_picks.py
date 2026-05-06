@@ -27,6 +27,10 @@ import requests
 import pandas as pd
 from datetime import date, timedelta
 from parbs_ban_list import is_banned, get_ban_reason
+from parbs_blowout_risk import (
+    get_full_risk_summary, get_pos_label, get_pos_mult, get_pos_delta,
+    BlowoutRiskEngine, POSITIONAL_DRTG, PLAYER_POSITIONS
+)
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
 NBA_HEADERS = {
