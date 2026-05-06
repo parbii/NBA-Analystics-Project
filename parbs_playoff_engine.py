@@ -86,6 +86,14 @@ PUBLIC_FADE = {
 
 CORE_STATS = {'Points', 'Rebounds', 'Assists', 'Pts+Rebs+Asts'}
 
+ESPN_ABBR_MAP = {
+    'NY':'NYK','SA':'SAS','GS':'GSW','NO':'NOP','PHO':'PHX',
+    'WSH':'WAS','CHA':'CHO','UTH':'UTA',
+}
+
+def fix_abbr(a):
+    return ESPN_ABBR_MAP.get(a, a)
+
 def norm(s):
     n = unicodedata.normalize('NFD', str(s))
     n = ''.join(c for c in n if unicodedata.category(c) != 'Mn')
@@ -300,7 +308,8 @@ def run(target_date):
 
     # PrizePicks
     print('\n  Pulling PrizePicks lines...')
-    pp_lines = get_prizepicks_lines(target_date, tonight_teams)
+    tonight_teams_norm = {fix_abbr(t) for t in tonight_teams} | tonight_teams
+    pp_lines = get_prizepicks_lines(target_date, tonight_teams_norm)
     print(f"  {len(pp_lines)} prop lines loaded")
 
     # Series engines
@@ -310,11 +319,25 @@ def run(target_date):
     print('\n  Pulling playoff game logs...')
     all_nba = nba_players_static.get_players()
 
+    # Normalize tonight_teams and maps
+    tonight_teams_norm = {fix_abbr(t) for t in tonight_teams} | tonight_teams
+    opp_map_norm    = {fix_abbr(k): fix_abbr(v) for k,v in opp_map.items()}
+    spread_map_norm = {fix_abbr(k): v for k,v in spread_map.items()}
+    series_engines_norm = {}
+    for k,v in series_engines.items():
+        series_engines_norm[fix_abbr(k)] = v
+        series_engines_norm[k] = v
+
+    opp_map    = opp_map_norm
+    spread_map = spread_map_norm
+    series_engines = series_engines_norm
+
     # Get all players with PrizePicks lines tonight
     pp_players = set()
     for (name, team, stat) in pp_lines.keys():
-        if team in tonight_teams:
-            pp_players.add((name, team))
+        norm_team = fix_abbr(team)
+        if norm_team in tonight_teams_norm or team in tonight_teams_norm:
+            pp_players.add((name, fix_abbr(team)))
 
     logs = {}
     for name, team in pp_players:
@@ -344,8 +367,17 @@ def run(target_date):
             s_data = get_series(df, stat)
             if len(s_data) < 3: continue
 
-            key   = (name, team, stat)
-            ldata = pp_lines.get(key, {'goblin':[],'standard':[],'demon':[]})
+            # Try both normalized and original team abbreviation
+            key = (name, team, stat)
+            ldata = pp_lines.get(key)
+            if ldata is None:
+                # Try original ESPN abbreviation
+                for orig, norm_t in ESPN_ABBR_MAP.items():
+                    if norm_t == team:
+                        ldata = pp_lines.get((name, orig, stat))
+                        if ldata: break
+            if ldata is None:
+                ldata = {'goblin':[],'standard':[],'demon':[]}
 
             for ltype, llist in [('goblin', ldata['goblin']),
                                   ('standard', ldata['standard']),
@@ -456,61 +488,222 @@ def run(target_date):
         for flag in r['flags'][:3]:
             print(f"    → {flag}")
 
-    # Parlay builder
-    seen = set(); deduped = []
-    for r in results:
-        if r['ltype'] == 'goblin':
+    # ── Separate goblin and demon pools ──────────────────────────────────────
+    GO = {'ELITE':0,'STRONG':1,'SOLID':2,'LEAN':3}
+
+    def score(p):
+        return p['hit_p'] * abs(p['edge']) * (1/(p['p_val']+0.001))
+
+    def dedup_pool(pool):
+        seen_p = set(); out = []
+        for r in sorted(pool, key=score, reverse=True):
             k = (r['player'], r['stat'])
-            if k not in seen:
-                seen.add(k); deduped.append(r)
+            if k not in seen_p:
+                seen_p.add(k); out.append(r)
+        return out
 
-    clean = [p for p in deduped
-             if not p['fade']
-             and p['grade'] in ('ELITE','STRONG')
-             and p['risk_level'] not in ('CRITICAL',)]
+    # Goblin pool — safest, highest hit rate
+    goblin_pool = dedup_pool([
+        r for r in results
+        if r['ltype'] == 'goblin'
+        and not r['fade']
+        and r['grade'] in ('ELITE','STRONG','SOLID')
+        and r['risk_level'] not in ('CRITICAL',)
+    ])
 
-    def build6(pool):
+    # Demon pool — elevated lines, >50% hit rate only
+    demon_pool = dedup_pool([
+        r for r in results
+        if r['ltype'] == 'demon'
+        and not r['fade']
+        and r['hit_p'] >= 0.50
+        and r['grade'] in ('ELITE','STRONG','SOLID','LEAN')
+        and r['risk_level'] not in ('CRITICAL',)
+    ])
+
+    # ── Parlay math helpers ───────────────────────────────────────────────────
+    PAYOUTS = {2:3.0, 3:6.0, 4:10.0, 5:20.0, 6:35.0}
+
+    def parlay_prob(legs):
+        p = 1.0
+        for r in legs: p *= r['hit_p']
+        return p
+
+    def parlay_ev(legs, payout):
+        p = parlay_prob(legs)
+        return p, round(p*payout - (1-p)*1, 2)
+
+    def p_flex_5of6(legs):
+        if len(legs) < 6: return 0.0
+        return sum(
+            (1-legs[i]['hit_p']) * float(np.prod([legs[j]['hit_p']
+             for j in range(len(legs)) if j!=i]))
+            for i in range(len(legs))
+        )
+
+    def build_parlay(pool, n, require_games=2):
         seen_p = set(); legs = []
         for p in pool:
             if p['player'] in seen_p: continue
             legs.append(p); seen_p.add(p['player'])
-            if len(legs) == 6: break
-        return legs if len(set(game_map.get(p['team'],p['team']) for p in legs)) >= 2 else None
+            if len(legs) == n: break
+        if len(set(game_map.get(p['team'],p['team']) for p in legs)) < require_games:
+            return []
+        return legs
 
-    def score(p): return p['hit_p'] * p['edge'] * (1/(p['p_val']+0.001))
-    by_score = sorted(clean, key=score, reverse=True)
-    p6 = build6(by_score)
-
-    print()
-    print('='*100)
-    print('  OPTIMAL 6-LEG PARLAY — Real playoff data, no fades, risk-filtered')
-    print('='*100)
-
-    if p6:
-        prob = 1.0
-        for p in p6: prob *= p['hit_p']
-        ev = prob*25 - (1-prob)*1
-        p5 = sum((1-p6[i]['hit_p']) * float(np.prod([p6[j]['hit_p']
-                  for j in range(len(p6)) if j!=i]))
-                  for i in range(len(p6)))
-        print()
-        for i,p in enumerate(p6,1):
-            miss = f"  ⚠️ {','.join(p['miss'])}" if p['miss'] else ''
-            risk_icon = RISK_E.get(p['risk_level'],'')
-            print(f"  Leg {i}: {p['player']:<24} {p['stat']:<8} OVER {p['line']:<6} "
-                  f"{EMOJI.get(p['grade'],'')} {p['grade']} | "
-                  f"{p['hit_p']*100:.0f}% | +{p['edge']:.1f}% | "
-                  f"{risk_icon} {p['risk_level']}{miss}")
-        probs_str = ' x '.join([f"{p['hit_p']*100:.0f}%" for p in p6])
-        print(f"\n  P(all 6 hit) = {probs_str} = {prob*100:.1f}%")
-        print(f"  EV at 25x    = {prob:.3f}x$25 - {1-prob:.3f}x$1 = ${ev:.2f} per $1")
+    def print_parlay(legs, title, payout, label_type=''):
+        if not legs: return
+        prob, ev = parlay_ev(legs, payout)
+        p5 = p_flex_5of6(legs) if len(legs)==6 else 0
+        probs_str = ' x '.join([f"{p['hit_p']*100:.0f}%" for p in legs])
+        lbadge = {'goblin':'🟢','demon':'🔴','mixed':'🟡'}
+        badge = lbadge.get(label_type,'')
+        print(f"\n  {badge} {title}  (~{payout:.0f}x payout)")
+        print(f"  {'─'*90}")
+        for i,r in enumerate(legs,1):
+            lt = '🟢 GOB' if r['ltype']=='goblin' else '🔴 DEM'
+            miss_str = '  ⚠️ '+','.join(r['miss']) if r['miss'] else ''
+            print(f"  Leg {i}: {lt}  {r['player']:<22} {r['stat']:<8} OVER {r['line']:<6} "
+                  f"{EMOJI.get(r['grade'],'')} {r['grade']:<8} | "
+                  f"{r['hit_p']*100:.0f}% | +{r['edge']:.1f}%{miss_str}")
+        print(f"  P(all hit) = {probs_str} = {prob*100:.1f}%")
+        print(f"  EV at {payout:.0f}x  = {prob:.3f}x${payout:.0f} - {1-prob:.3f}x$1 = ${ev:.2f} per $1")
         if p5 > 0:
-            print(f"  P(5/6 hit)   = {p5*100:.1f}%  -> ~2x on Flex")
+            print(f"  P(5/6 flex) = {p5*100:.1f}%  → ~2x partial")
+        return prob, ev
+
+    # ── Print goblin summary ──────────────────────────────────────────────────
+    print()
+    print('='*100)
+    print('  BEST GOBLIN PICKS — Safest plays, highest hit rate')
+    print('  🟢 = goblin line (lower threshold, reduced payout, highest confidence)')
+    print('='*100)
+    print(f"\n  {'#':<3} {'Player':<22} {'Tm':<4} {'Stat':<8} {'Goblin':>7} "
+          f"{'PO Avg':>7} {'Hit%':>6} {'Edge%':>7} {'p':>7}  Grade")
+    print(f"  {'─'*85}")
+    for i,r in enumerate(goblin_pool[:12],1):
+        miss_str = ' ⚠️'+','.join(r['miss']) if r['miss'] else ''
+        print(f"  {i:<3} {r['player']:<22} {r['team']:<4} {r['stat']:<8} {r['line']:>7.1f} "
+              f"{r['mu']:>7.1f} {r['hit_p']*100:>5.0f}% {r['edge']:>6.1f}% "
+              f"{r['p_val']:>7.4f}  {EMOJI.get(r['grade'],'')} {r['grade']}{miss_str}")
+
+    # ── Print demon summary ───────────────────────────────────────────────────
+    print()
+    print('='*100)
+    print('  BEST DEMON PICKS — Elevated lines, >50% hit rate, higher payout')
+    print('  🔴 = demon line (higher threshold, bigger payout, more risk)')
+    print('='*100)
+    if demon_pool:
+        print(f"\n  {'#':<3} {'Player':<22} {'Tm':<4} {'Stat':<8} {'Demon':>7} "
+              f"{'PO Avg':>7} {'Hit%':>6} {'Edge%':>7} {'p':>7}  Grade")
+        print(f"  {'─'*85}")
+        for i,r in enumerate(demon_pool[:12],1):
+            miss_str = ' ⚠️'+','.join(r['miss']) if r['miss'] else ''
+            print(f"  {i:<3} {r['player']:<22} {r['team']:<4} {r['stat']:<8} {r['line']:>7.1f} "
+                  f"{r['mu']:>7.1f} {r['hit_p']*100:>5.0f}% {r['edge']:>6.1f}% "
+                  f"{r['p_val']:>7.4f}  {EMOJI.get(r['grade'],'')} {r['grade']}{miss_str}")
     else:
-        print('  Not enough clean picks for a 6-leg parlay.')
+        print('  No demon picks above 50% hit rate tonight.')
+
+    # ── Mixed parlay builder ──────────────────────────────────────────────────
+    print()
+    print('='*100)
+    print('  MIXED PARLAY BUILDER — Ranked by EV (best return on investment)')
+    print('  Strategy: anchor with safe goblins, boost payout with 1-2 demons')
+    print('  All parlays: no public fades | 2+ games | no duplicate players')
+    print('='*100)
+
+    # Build mixed pool: top goblins + top demons
+    top_goblins = goblin_pool[:8]
+    top_demons  = demon_pool[:6]
+
+    # Generate all parlay sizes and configurations
+    all_parlays = []
+
+    for size in [2, 3, 4, 5, 6]:
+        payout = PAYOUTS[size]
+
+        # Pure goblin
+        legs_g = build_parlay(top_goblins, size)
+        if legs_g:
+            prob, ev = parlay_ev(legs_g, payout)
+            all_parlays.append({
+                'legs':legs_g,'size':size,'payout':payout,
+                'prob':prob,'ev':ev,'type':'goblin',
+                'label':f'SAFE {size}-LEG (all goblin)',
+            })
+
+        # Mixed: goblins + 1 demon
+        if top_demons and size >= 3:
+            mixed1 = build_parlay(top_goblins, size-1) + [top_demons[0]]
+            # Remove duplicate players
+            seen_mix = set()
+            mixed1_clean = []
+            for r in mixed1:
+                if r['player'] not in seen_mix:
+                    seen_mix.add(r['player']); mixed1_clean.append(r)
+            if len(mixed1_clean) == size:
+                prob, ev = parlay_ev(mixed1_clean, payout)
+                all_parlays.append({
+                    'legs':mixed1_clean,'size':size,'payout':payout,
+                    'prob':prob,'ev':ev,'type':'mixed',
+                    'label':f'MIXED {size}-LEG (1 demon)',
+                })
+
+        # Mixed: goblins + 2 demons
+        if len(top_demons) >= 2 and size >= 4:
+            mixed2 = build_parlay(top_goblins, size-2) + top_demons[:2]
+            seen_mix = set()
+            mixed2_clean = []
+            for r in mixed2:
+                if r['player'] not in seen_mix:
+                    seen_mix.add(r['player']); mixed2_clean.append(r)
+            if len(mixed2_clean) == size:
+                prob, ev = parlay_ev(mixed2_clean, payout)
+                all_parlays.append({
+                    'legs':mixed2_clean,'size':size,'payout':payout,
+                    'prob':prob,'ev':ev,'type':'mixed',
+                    'label':f'MIXED {size}-LEG (2 demons)',
+                })
+
+        # Pure demon
+        if len(top_demons) >= size:
+            legs_d = build_parlay(top_demons, size)
+            if legs_d:
+                prob, ev = parlay_ev(legs_d, payout)
+                all_parlays.append({
+                    'legs':legs_d,'size':size,'payout':payout,
+                    'prob':prob,'ev':ev,'type':'demon',
+                    'label':f'HIGH-RISK {size}-LEG (all demon)',
+                })
+
+    # Sort by EV descending — best return on investment first
+    all_parlays.sort(key=lambda x: -x['ev'])
+
+    # Print top parlays by EV
+    print()
+    print(f"  {'Rank':<5} {'Parlay':<35} {'P(win)':>8} {'EV/dollar':>10}  Type")
+    print(f"  {'─'*70}")
+    for i,p in enumerate(all_parlays[:15],1):
+        badge = '🟢' if p['type']=='goblin' else ('🔴' if p['type']=='demon' else '🟡')
+        print(f"  {i:<5} {p['label']:<35} {p['prob']*100:>7.1f}% {p['ev']:>9.2f}  {badge}")
+
+    # Print top 5 in detail
+    print()
+    print('  TOP 5 PARLAYS IN DETAIL (best EV):')
+    for p in all_parlays[:5]:
+        print_parlay(p['legs'], p['label'], p['payout'], p['type'])
 
     print()
     print('='*100)
+    print('  HOW TO READ THIS:')
+    print('  🟢 SAFE    = all goblin lines. Highest hit rate, lowest payout.')
+    print('  🟡 MIXED   = mostly goblins + 1-2 demons. Best risk/reward balance.')
+    print('  🔴 HIGH-RISK = all demon lines. Highest payout, more variance.')
+    print('  EV/dollar  = expected profit per $1 bet long-term. Higher = better.')
+    print('  Best play  = highest EV that you are comfortable with the risk level.')
+    print('='*100)
+    print()
     print('  Run: python3 parbs_playoff_engine.py --tomorrow  for next game')
     print('='*100)
 
