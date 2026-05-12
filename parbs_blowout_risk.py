@@ -136,6 +136,81 @@ def get_pos_label(player_name: str, opp_team: str) -> str:
         return f'→ {opp_team} neutral on {pos} ({delta:+.1f})'
 
 
+def get_matchup_context(team: str, opp: str, stat: str, team_stats: dict = None) -> list:
+    """
+    Returns advanced stat context notes for a pick.
+    Uses live team_stats if provided, otherwise falls back to positional DRtg only.
+    """
+    notes = []
+    if not team_stats:
+        return notes
+
+    t = team_stats.get(team, {})
+    o = team_stats.get(opp, {})
+    if not t or not o:
+        return notes
+
+    if stat == 'Rebounds':
+        opp_dreb = o.get('DREB_PCT', 73)
+        opp_oreb_allowed = o.get('OPP_OREB_PCT', 28)
+        team_oreb = t.get('OREB_PCT', 28)
+        if opp_dreb >= 76:
+            notes.append(f'{opp} DREB% {opp_dreb}% (elite) — limits 2nd chances')
+        elif opp_dreb <= 69:
+            notes.append(f'{opp} DREB% {opp_dreb}% (weak) — misses stay alive')
+        if opp_oreb_allowed >= 31:
+            notes.append(f'{opp} allows {opp_oreb_allowed}% OREB — gives up 2nd chances')
+        if team_oreb >= 31:
+            notes.append(f'{team} OREB% {team_oreb}% (top 10) — crashes glass aggressively')
+
+    elif stat == 'Assists':
+        team_ast = t.get('AST_PCT', 60)
+        if team_ast >= 64:
+            notes.append(f'{team} AST% {team_ast}% — elite ball movement, assists flow')
+        opp_tov = o.get('OPP_TOV_PCT', 14)
+        if opp_tov >= 16:
+            notes.append(f'{opp} forces {opp_tov}% TOV — high pressure, disrupts assists')
+
+    elif stat in ('Points', 'Pts+Rebs+Asts'):
+        opp_def = o.get('DEF_RATING', 114)
+        opp_pts = o.get('OPP_PTS', 114)
+        if opp_def <= 108:
+            notes.append(f'{opp} DEF RTG {opp_def} (elite) — tough scoring environment')
+        elif opp_def >= 116:
+            notes.append(f'{opp} DEF RTG {opp_def} (soft) — easy scoring environment')
+        notes.append(f'{opp} allows {opp_pts} PPG')
+
+    return notes
+    """
+    Returns the positional DRtg delta for a player vs their opponent.
+    Only meaningful for Points and PRA (scoring-based stats).
+    """
+    if stat not in ('Points', 'Pts+Rebs+Asts'):
+        return 0.0
+    pos = PLAYER_POSITIONS.get(player_name)
+    if not pos:
+        return 0.0
+    return POSITIONAL_DRTG.get(opp_team, {}).get(pos, 0.0)
+
+
+def get_pos_mult(player_name: str, opp_team: str, stat: str) -> float:
+    """Returns projection multiplier from positional DRtg. Capped at ±10%."""
+    delta = get_pos_delta(player_name, opp_team, stat)
+    return max(0.90, min(1.10, 1.0 + delta * 0.008))
+
+
+def get_pos_label(player_name: str, opp_team: str) -> str:
+    """Returns human-readable matchup label."""
+    pos = PLAYER_POSITIONS.get(player_name, '?')
+    delta = POSITIONAL_DRTG.get(opp_team, {}).get(pos, 0.0)
+    if delta >= 2.0:
+        return f'✅ {opp_team} soft on {pos} (+{delta}) — scoring boost'
+    elif delta <= -2.0:
+        return f'⚠️  {opp_team} elite on {pos} ({delta}) — tough matchup'
+    else:
+        return f'→ {opp_team} neutral on {pos} ({delta:+.1f})'
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BLOWOUT RISK ENGINE
 # ─────────────────────────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ from parbs_blowout_risk import (
     get_pos_label, POSITIONAL_DRTG, PLAYER_POSITIONS
 )
 from parbs_ban_list import is_banned
+from parbs_team_stats import get_team_stats, get_matchup_summary, print_matchup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SERIES RESULTS — Update this daily with actual scores
@@ -299,6 +300,25 @@ def run(target_date):
         spread_map[g['home']] = g['spread']
         spread_map[g['away']] = -g['spread']
 
+    # Team advanced stats — pulled live, cached daily
+    print('\n  Pulling team advanced stats...')
+    team_stats = get_team_stats()
+
+    # Print matchup context for tonight's games
+    print()
+    print('='*100)
+    print('  TEAM ADVANCED STATS — MATCHUP CONTEXT')
+    print('  Source: nba_api stats.nba.com | 2025-26 season | cached daily')
+    print('='*100)
+    for g in playoff_games:
+        away_n = fix_abbr(g['away'])
+        home_n = fix_abbr(g['home'])
+        if away_n in team_stats and home_n in team_stats:
+            print_matchup(away_n, home_n, team_stats)
+        else:
+            # Try raw abbreviations
+            print_matchup(g['away'], g['home'], team_stats)
+
     # Injuries
     print('\n  Pulling live injury report...')
     injury_report = get_injuries()
@@ -357,13 +377,14 @@ def run(target_date):
 
     for (name, team), df in logs.items():
         if is_out(name, injury_report): continue
-        if is_banned(name): continue
+        if is_banned(name): continue  # full ban check
 
         opp    = opp_map.get(team, '?')
         spread = spread_map.get(team, 0.0)
         engine = series_engines.get(team, BlowoutRiskEngine())
 
         for stat in ['Points', 'Rebounds', 'Assists', 'Pts+Rebs+Asts']:
+            if is_banned(name, stat): continue
             s_data = get_series(df, stat)
             if len(s_data) < 3: continue
 
@@ -391,12 +412,17 @@ def run(target_date):
                     if df is not None and 'FGA' in df.columns:
                         l10_fga = round(df.head(10)['FGA'].mean(), 1)
 
-                    # Full risk assessment
+                    # Full risk assessment — uses live team stats
+                    t_stats = team_stats.get(team, {})
+                    ssn_min_live = 30.0
+                    if df is not None and 'MIN' in df.columns:
+                        ssn_min_live = round(float(df['MIN'].mean()), 1)
+
                     risk = get_full_risk_summary(
                         player_name=name, team=team, opp_team=opp,
                         stat=stat, direction='OVER', line=line,
                         proj=sb['mu'], spread=spread,
-                        ssn_min=30.0,  # use playoff avg min if available
+                        ssn_min=ssn_min_live,
                         l10_fga=l10_fga,
                         series_engine=engine,
                     )
@@ -522,7 +548,34 @@ def run(target_date):
     ])
 
     # ── Parlay math helpers ───────────────────────────────────────────────────
-    PAYOUTS = {2:3.0, 3:6.0, 4:10.0, 5:20.0, 6:35.0}
+    # PrizePicks actual payouts — goblin lines pay MUCH less than demons
+    # These are approximate multipliers based on user-confirmed data:
+    #   All-goblin parlays pay roughly:
+    #     2-leg: ~1.5x  |  3-leg: ~1.8x  |  4-leg: ~2x  |  5-leg: ~3x  |  6-leg: ~5x
+    #   All-demon parlays pay roughly:
+    #     2-leg: ~3x  |  3-leg: ~6x  |  4-leg: ~10x  |  5-leg: ~20x  |  6-leg: ~35x
+    #   Mixed parlays scale between goblin and demon based on composition
+    #   Standard lines are in between
+    PAYOUTS_GOBLIN = {2: 1.5, 3: 1.8, 4: 2.0, 5: 3.0, 6: 5.0}
+    PAYOUTS_DEMON  = {2: 3.0, 3: 6.0, 4: 10.0, 5: 20.0, 6: 35.0}
+    PAYOUTS_STD    = {2: 2.0, 3: 3.5, 4: 5.0, 5: 10.0, 6: 18.0}
+
+    def get_payout(legs, size):
+        """Calculate payout based on mix of goblin/demon/standard legs."""
+        g = sum(1 for r in legs if r['ltype'] == 'goblin')
+        d = sum(1 for r in legs if r['ltype'] == 'demon')
+        s = sum(1 for r in legs if r['ltype'] == 'standard')
+        total = g + d + s
+        if total == 0: return 1.0
+        # Weighted average between goblin and demon payouts
+        gob_pay = PAYOUTS_GOBLIN.get(size, 2.0)
+        dem_pay = PAYOUTS_DEMON.get(size, 10.0)
+        std_pay = PAYOUTS_STD.get(size, 5.0)
+        # Weight by proportion of each type
+        payout = (g * gob_pay + d * dem_pay + s * std_pay) / total
+        return round(payout, 1)
+
+    PAYOUTS = {2:3.0, 3:6.0, 4:10.0, 5:20.0, 6:35.0}  # legacy fallback
 
     def parlay_prob(legs):
         p = 1.0
